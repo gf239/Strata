@@ -664,7 +664,8 @@ struct Engine {
     // latency is its tiles, so more splits are faster (RTX 4090, tg128 after 512: 32/16 265.1, 64/17 271.9 tok/s)
     int ns_full = std::getenv("FLINT_NS_FULL") ? std::atoi(std::getenv("FLINT_NS_FULL")) : 64;
     int ns_swa = std::getenv("FLINT_NS_SWA") ? std::atoi(std::getenv("FLINT_NS_SWA")) : 17;
-    std::vector<__half*> kc, vc;
+    std::vector<void*> kc, vc;   // per layer: K / V, FP16 (or E4M3 bytes with kv8)
+    bool kv8 = false;             // --kv-fp8
     std::vector<int> cap;
     int ld_qkv = 0;
     // the prompt
@@ -835,15 +836,16 @@ struct Engine {
         for (const Layer& L : m->layers) {
             const int c = L.swa ? R : ctx;
             cap.push_back(c);
-            kc.push_back(dalloc_t<__half>(KD * (size_t) c));
-            vc.push_back(dalloc_t<__half>(KD * (size_t) c));
-            kvb += 2 * KD * (size_t) c * 2;
+            const size_t nb = KD * (size_t) c * (kv8 ? 1 : 2);
+            kc.push_back(dalloc_t<uint8_t>(nb));
+            vc.push_back(dalloc_t<uint8_t>(nb));
+            kvb += 2 * nb;
         }
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-flint: context %d cells (K / V %.2f GiB fp16, window ring %d cells), prompt chunk %d, "
-                     "%.2f GiB of VRAM free\n", ctx, kvb / 1073741824.0, R, tmax, fr / 1073741824.0);
+        std::fprintf(stderr, "strata-flint: context %d cells (K / V %.2f GiB %s, window ring %d cells), prompt chunk %d, "
+                     "%.2f GiB of VRAM free\n", ctx, kvb / 1073741824.0, kv8 ? "fp8 e4m3" : "fp16", R, tmax, fr / 1073741824.0);
     }
 
     void reset() { pos = 0; }
@@ -998,15 +1000,20 @@ struct Engine {
             ldq = (int) QD; ldk = ldv = (int) KD;
         }
         const float scale = 1.0f / sqrtf((float) HD);
-        if (T == 1 && fused) {   // (more rows would read each other's new cells before they are written)
+        if (T == 1 && (fused || kv8)) {   // (more rows would read each other's new cells before they are written)
             const int NS = L.swa ? ns_swa : ns_full;
-            if (attn2)
-                flk::k_attn_dec2<<<dim3(NS, HKV, 1), 256, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, kc[li], vc[li], H,
-                                                                  cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0,
-                                                                  L.rope ? rope_tab : nullptr, pos0, m->eps, scale, NS, pacc, pm, pl,
-                                                                  L.sinks, att, (QB*) q8, aticket);
+            if (kv8)
+                flk::k_attn_dec2<true><<<dim3(NS, HKV, 1), 256, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, kc[li], vc[li],
+                                                                        H, cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0,
+                                                                        L.rope ? rope_tab : nullptr, pos0, m->eps, scale, NS, pacc,
+                                                                        pm, pl, L.sinks, att, (QB*) q8, aticket);
+            else if (attn2)
+                flk::k_attn_dec2<false><<<dim3(NS, HKV, 1), 256, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, kc[li], vc[li],
+                                                                         H, cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0,
+                                                                         L.rope ? rope_tab : nullptr, pos0, m->eps, scale, NS, pacc,
+                                                                         pm, pl, L.sinks, att, (QB*) q8, aticket);
             else
-                flk::k_attn_dec<<<dim3(NS, HKV, 1), 256, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, kc[li], vc[li], H,
+                flk::k_attn_dec<<<dim3(NS, HKV, 1), 256, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, (__half*) kc[li], (__half*) vc[li], H,
                                                                  cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0, L.rope ? 1 : 0, pos0,
                                                                  m->rope_base, m->eps, scale, NS, pacc, pm, pl, L.sinks, att, (QB*) q8,
                                                                  aticket);
@@ -1024,10 +1031,10 @@ struct Engine {
             return false;
         }
         flk::k_prep<<<dim3(H + HKV, T), HD, 0, st>>>(qs, ldq, ks, ldk, vs, ldv, L.q_norm, L.k_norm, q, kc[li], vc[li], H, cap[li],
-                                                    L.swa ? 1 : 0, L.rope ? 1 : 0, pos0, m->rope_base, m->eps);
-        if (T <= kGemmT) {
+                                                    L.swa ? 1 : 0, L.rope ? 1 : 0, pos0, m->rope_base, m->eps, kv8 ? 1 : 0);
+        if (T <= kGemmT && !kv8) {   // (an E4M3 cache: these rows take the flash-attention path below)
             const int NS = L.swa ? ns_swa : ns_full;
-            flk::k_dattn<<<dim3(NS, HKV, T), 256, 0, st>>>(q, kc[li], vc[li], H, cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0,
+            flk::k_dattn<<<dim3(NS, HKV, T), 256, 0, st>>>(q, (const __half*) kc[li], (const __half*) vc[li], H, cap[li], L.swa ? 1 : 0, L.swa ? m->win : 0,
                                                           pos0, scale, NS, pacc, pm, pl);
             flk::k_dattn_merge<<<T * H, HD, 0, st>>>(pacc, pm, pl, L.sinks, H, NS, att, (QB*) q8);
             mmq(L.wo, q8, y, T);
@@ -1036,17 +1043,24 @@ struct Engine {
         // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation) per KV head over its 8 query
         // heads, the masked softmax with the sink in between; the queries in slices whose scores fit
         int lo = 0, P = (int) p0 + T, kstride = cap[li];
-        const __half *Kb = kc[li], *Vb = vc[li];
+        const void *Kb = kc[li], *Vb = vc[li];
+        bool k8 = kv8;   // the keys FA reads: the cache's own bytes, or the gathered FP16 window
         if (L.swa) {
             lo = (int) std::max<int64_t>(0, p0 - (m->win - 1));
             P = (int) (p0 + T - lo);
-            flk::k_kv_gather<<<grid1((int64_t) HKV * P * HD / 2), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, cap[li], lo, P, HKV);
+            if (kv8) flk::k_kv_gather<true><<<grid1((int64_t) HKV * P * HD / 2), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, cap[li], lo, P, HKV);
+            else flk::k_kv_gather<false><<<grid1((int64_t) HKV * P * HD / 2), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, cap[li], lo, P, HKV);
             Kb = k16; Vb = v16; kstride = P;
+            k8 = false;
         }
         k_to_f16<<<grid1((int64_t) T * QD), kThreads, 0, st>>>(q, q16, (int64_t) T * QD);
-        if (fa) {   // one flash-attention launch: the keys from the cache (full layers) or the gathered window
-            ffa::k_fa_prompt<<<dim3((T + 7) / 8, HKV), 128, 0, st>>>(q16, Kb, Vb, kstride, lo, T, H, (int) p0,
-                                                                    L.swa ? m->win : 0, scale, L.sinks, att);
+        if (fa || kv8) {   // one flash-attention launch: the keys from the cache (full layers) or the gathered window
+            if (k8)
+                ffa::k_fa_prompt<true><<<dim3((T + 7) / 8, HKV), 128, 0, st>>>(q16, Kb, Vb, kstride, lo, T, H, (int) p0,
+                                                                              L.swa ? m->win : 0, scale, L.sinks, att);
+            else
+                ffa::k_fa_prompt<false><<<dim3((T + 7) / 8, HKV), 128, 0, st>>>(q16, Kb, Vb, kstride, lo, T, H, (int) p0,
+                                                                               L.swa ? m->win : 0, scale, L.sinks, att);
             mm(L.wo, att, y, T);
             return false;
         }
@@ -1057,7 +1071,7 @@ struct Engine {
         for (int t0 = 0; t0 < T; t0 += tq) {
             const int nt = std::min(tq, T - t0);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = Kb + (size_t) kvh * kstride * HD;
+                const __half* Kh = (const __half*) Kb + (size_t) kvh * kstride * HD;
                 const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
                 float* Sh = att_s + (size_t) kvh * G * nt * ldp;
                 if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh,
@@ -1070,7 +1084,7 @@ struct Engine {
             flk::k_softmax_sink<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, lo, (int) p0 + t0,
                                                                   L.swa ? m->win : 0, scale, L.sinks);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Vh = Vb + (size_t) kvh * kstride * HD;
+                const __half* Vh = (const __half*) Vb + (size_t) kvh * kstride * HD;
                 const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
                 float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                 if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh,
@@ -1353,6 +1367,31 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         return hpin[2];
     }
+    /// The last row's 64 largest logits (value, id; the largest first) on the host: the sampling candidates.
+    uint32_t* tc_k = nullptr;
+    int32_t *tc_i = nullptr, *tc_oi = nullptr, *h_tci = nullptr;
+    float *tc_ov = nullptr, *h_tcv = nullptr;
+    void host_topc(std::vector<float>& vals, std::vector<int32_t>& idv) {
+        const int nb = (m->n_vocab + 2047) / 2048;
+        if (!tc_k) {
+            CK(cudaMalloc(&tc_k, (size_t) nb * flk::kTopC * 4));
+            CK(cudaMalloc(&tc_i, (size_t) nb * flk::kTopC * 4));
+            CK(cudaMalloc(&tc_ov, flk::kTopC * 4));
+            CK(cudaMalloc(&tc_oi, flk::kTopC * 4));
+            CK(cudaHostAlloc((void**) &h_tcv, flk::kTopC * 4, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &h_tci, flk::kTopC * 4, cudaHostAllocDefault));
+        }
+        flk::k_topc1<<<nb, 256, 0, st>>>(logits, m->n_vocab, tc_k, tc_i);
+        const int nc = nb * flk::kTopC;
+        if (nc <= 512 * 10) flk::k_topc2<10><<<1, 512, 0, st>>>(tc_k, tc_i, nc, tc_ov, tc_oi);
+        else if (nc <= 512 * 20) flk::k_topc2<20><<<1, 512, 0, st>>>(tc_k, tc_i, nc, tc_ov, tc_oi);
+        else { std::fprintf(stderr, "strata-flint: a vocabulary too large for the sampling candidates\n"); std::exit(1); }
+        CK(cudaMemcpyAsync(h_tcv, tc_ov, flk::kTopC * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(h_tci, tc_oi, flk::kTopC * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        vals.assign(h_tcv, h_tcv + flk::kTopC);
+        idv.assign(h_tci, h_tci + flk::kTopC);
+    }
     void host_logits(std::vector<float>& out) {
         out.resize((size_t) m->n_vocab);
         CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
@@ -1429,6 +1468,40 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
     return idx[keep - 1];
 }
 
+/// sample() over the candidates (the 64 largest logits, the largest first): the same temperature / top-k / top-p /
+/// min-p as on the whole row, exact whenever top_k is 1 .. 64 and no penalty is set (the keep list never reaches past
+/// the 64).
+bool topc_ok(const Sampling& s) { return s.temperature > 0.f && s.top_k > 0 && s.top_k <= 64 && s.repeat == 1.f && s.freq == 0.f && s.present == 0.f; }
+int sample_topc(const std::vector<float>& v, const std::vector<int32_t>& id, const Sampling& s, std::mt19937_64& rng) {
+    const size_t k = std::min<size_t>((size_t) s.top_k, v.size());
+    std::vector<double> p(k);
+    const double mx = v[0];
+    double sum = 0;
+    for (size_t i = 0; i < k; ++i) sum += p[i] = std::exp((v[i] - mx) / s.temperature);
+    size_t keep = k;
+    if (s.top_p < 1.f) {
+        double c = 0;
+        for (size_t i = 0; i < k; ++i) {
+            c += p[i] / sum;
+            if (c >= s.top_p) { keep = i + 1; break; }
+        }
+    }
+    if (s.min_p > 0.f) {
+        size_t j = 0;
+        while (j < keep && p[j] / p[0] >= s.min_p) ++j;
+        keep = std::max<size_t>(1, j);
+    }
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (size_t i = 0; i < keep; ++i) {
+        r -= p[i];
+        if (r <= 0) return id[i];
+    }
+    return id[keep - 1];
+}
+
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
     while (*s) {
@@ -1452,7 +1525,10 @@ struct Serve {
     bool eof = false;
     std::atomic<bool> stop{false};
     std::vector<int32_t> live;   // the tokens whose K / V the cache holds (cell i = live[i])
-    std::vector<float> lg;
+    std::vector<float> lg, tcv;
+    std::vector<int32_t> tci;
+    const bool topc_check = std::getenv("FLINT_TOPC_CHECK") != nullptr;
+    long long topc_n = 0, topc_bad = 0;
     explicit Serve(Engine& e) : E(e) {}
 
     void request(const std::string& line) {
@@ -1534,8 +1610,24 @@ struct Serve {
         int nx = smp.needs_logits() ? -1 : E.greedy();
         for (;;) {
             if (smp.needs_logits()) {
-                E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                if (topc_ok(smp)) {   // the 64 candidates from the GPU, not the whole row
+                    E.host_topc(tcv, tci);
+                    if (topc_check) {   // FLINT_TOPC_CHECK: the candidates against the whole row's sort
+                        E.host_logits(lg);
+                        std::vector<int> ix(lg.size());
+                        for (size_t i = 0; i < ix.size(); ++i) ix[i] = (int) i;
+                        std::partial_sort(ix.begin(), ix.begin() + flk::kTopC, ix.end(), [&](int a, int b) {
+                            return lg[(size_t) a] > lg[(size_t) b] || (lg[(size_t) a] == lg[(size_t) b] && a < b); });
+                        int bad = 0;
+                        for (int i = 0; i < flk::kTopC; ++i) bad += lg[(size_t) ix[(size_t) i]] != tcv[(size_t) i];
+                        ++topc_n;
+                        topc_bad += bad > 0;
+                    }
+                    nx = sample_topc(tcv, tci, smp, rng);
+                } else {
+                    E.host_logits(lg);
+                    nx = sample(lg, smp, hist, rng);
+                }
             }
             std::printf("T %d\n", nx);
             std::fflush(stdout);
@@ -1558,6 +1650,7 @@ struct Serve {
                      "generated in %.0f ms (%.1f tok/s, %s)\n", ids.size(), reuse, (long long) fresh, prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish);
+        if (topc_check) std::fprintf(stderr, "strata-flint serve: sampling candidates checked %lld rows, %lld differ\n", topc_n, topc_bad);
     }
 
     int run() {
@@ -1597,7 +1690,7 @@ struct Serve {
 int strata::flint::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full;
     int ctx = 0, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;   // 0: auto (what fits beside the weights)
-    bool warm = true, serve_mode = false, graph = true, embd_gpu = false;
+    bool warm = true, serve_mode = false, graph = true, embd_gpu = false, kv_fp8 = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1620,6 +1713,7 @@ int strata::flint::run(int argc, char** argv) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-warmup") warm = false;
         else if (a == "--embd-gpu") embd_gpu = true;
+        else if (a == "--kv-fp8") kv_fp8 = true;   // the K / V cache as E4M3: half the bytes, twice the context
         else if (serve_mode && a.rfind("--", 0) == 0) {
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
             std::fprintf(stderr, "strata-flint: ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "",
@@ -1664,14 +1758,17 @@ int strata::flint::run(int argc, char** argv) {
         const double GiB = 1073741824.0;
         int n_full = 0, n_swa = 0;
         for (const Layer& L : m.layers) (L.swa ? n_swa : n_full) += 1;
-        const double cell = (double) n_full * 2 * m.HKV * m.HD * 2;
-        auto ring = [&](int c) { return (double) std::max(2048, (m.win + c + 255) / 256 * 256) * n_swa * 2 * m.HKV * m.HD * 2; };
+        const double es = kv_fp8 ? 1.0 : 2.0;   // bytes per cached value
+        const double cell = (double) n_full * 2 * m.HKV * m.HD * es;
+        auto ring = [&](int c) { return (double) std::max(2048, (m.win + c + 255) / 256 * 256) * n_swa * 2 * m.HKV * m.HD * es; };
         auto bufs = [&](int c) { return 0.19 * GiB + (double) c * 245.0 * 1024.0; };
         const double room = (double) fr - 0.2 * GiB;
         auto fits = [&](int c, int x) { return bufs(c) + ring(c) + cell * x <= room; };
         if (chunk == 0) {
-            const int want_ctx = ctx > 0 ? ctx : 16384;   // an auto context keeps 16K cells before it grows the chunk
-            chunk = 256;
+            // an auto context aims at 32K cells before the chunk grows past 1024; when not even that fits, chunk 1024
+            // and the context that does (Q4_K_M with FP16 K / V on 24 GB: 17K)
+            const int want_ctx = ctx > 0 ? ctx : 32768;
+            chunk = ctx > 0 ? 256 : 1024;
             for (int c : {2048, 1024, 512})
                 if (fits(c, want_ctx)) { chunk = c; break; }
         }
@@ -1681,6 +1778,7 @@ int strata::flint::run(int argc, char** argv) {
     }
     Engine E;
     E.use_graph = graph;
+    E.kv8 = kv_fp8;
     E.init(m, ctx, chunk);
     E.reset();
     if (warm) E.warmup();

@@ -9,6 +9,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <cmath>
@@ -35,15 +36,29 @@ constexpr int kGrp = 8;     // query heads per KV head
 constexpr int kTile = 32;   // cells per decode-attention tile (one per lane)
 constexpr int kKS = kHD + 2;   // K rows in shared memory padded by one word: lane j reading row j hits bank (j + d) % 32
 
+// --kv-fp8: the cache's K / V as E4M3 bytes (saturating), widened to FP16 as they are read
+__device__ __forceinline__ uint16_t f2_to_e4m3x2(float a, float b) {
+    return (uint16_t) __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+}
+__device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t v) {
+    const __half2_raw r = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) v, __NV_E4M3);
+    return (uint32_t) r.x | ((uint32_t) r.y << 16);
+}
+/// 8 E4M3 values (one 8-byte word) as 8 FP16 (one 16-byte word).
+__device__ __forceinline__ uint4 e4m3x8_to_h8(uint2 w) {
+    return make_uint4(e4m3x2_to_h2((uint16_t) (w.x & 0xffff)), e4m3x2_to_h2((uint16_t) (w.x >> 16)),
+                      e4m3x2_to_h2((uint16_t) (w.y & 0xffff)), e4m3x2_to_h2((uint16_t) (w.y >> 16)));
+}
+
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q, k and v of row t at qs + t * ldq,
 /// ks + t * ldk, vs + t * ldv; q and k RMS-normed per head with their weights, NEOX RoPE over the whole head on the
 /// rope layers, q into `q` (f32 [T][H][HD]), k / v into the layer's fp16 cache at their cell (pos % cap for a ring).
 /// grid (H + HKV, T), block 128.
 __global__ void __launch_bounds__(kHD) k_prep(const float* __restrict__ qs, int ldq, const float* __restrict__ ks, int ldk,
                                               const float* __restrict__ vs, int ldv, const float* __restrict__ qw,
-                                              const float* __restrict__ kw, float* __restrict__ q, __half* __restrict__ kc,
-                                              __half* __restrict__ vc, int H, int cap, int ring, int rope,
-                                              const int32_t* __restrict__ pos0, float base, float eps) {
+                                              const float* __restrict__ kw, float* __restrict__ q, void* __restrict__ kc_,
+                                              void* __restrict__ vc_, int H, int cap, int ring, int rope,
+                                              const int32_t* __restrict__ pos0, float base, float eps, int kv8 = 0) {
     __shared__ float buf[kHD];
     __shared__ float red[kHD / 32];
     const int head = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
@@ -73,8 +88,18 @@ __global__ void __launch_bounds__(kHD) k_prep(const float* __restrict__ qs, int 
         return;
     }
     const int cell = ring ? pos % cap : pos;
-    kc[((size_t) kh * cap + cell) * kHD + i] = __float2half(v);
-    vc[((size_t) kh * cap + cell) * kHD + i] = __float2half(vs[(size_t) t * ldv + (size_t) kh * kHD + i]);
+    const float vv = vs[(size_t) t * ldv + (size_t) kh * kHD + i];
+    const size_t at = ((size_t) kh * cap + cell) * kHD + i;
+    if (kv8) {   // pairs: the even thread writes both bytes
+        const float v_odd = __shfl_down_sync(0xffffffffu, v, 1), vv_odd = __shfl_down_sync(0xffffffffu, vv, 1);
+        if ((i & 1) == 0) {
+            reinterpret_cast<uint16_t*>((uint8_t*) kc_ + at)[0] = f2_to_e4m3x2(v, v_odd);
+            reinterpret_cast<uint16_t*>((uint8_t*) vc_ + at)[0] = f2_to_e4m3x2(vv, vv_odd);
+        }
+        return;
+    }
+    ((__half*) kc_)[at] = __float2half(v);
+    ((__half*) vc_)[at] = __float2half(vv);
 }
 
 /// Decode attention partials.  Block (split s, KV head g, row t) takes its share of the cells row t sees - [pos - (win
@@ -181,7 +206,8 @@ __global__ void __launch_bounds__(kHD) k_dattn_merge(const float* __restrict__ p
 
 /// The prompt's window-layer K / V: cells [lo, lo + P) of the ring (cap cells) into compact [kvh][P][HD] halves.
 /// grid1(HKV * P * HD / 2) over half2.
-__global__ void k_kv_gather(const __half* __restrict__ kc, const __half* __restrict__ vc, __half* __restrict__ k16,
+template <bool KV8 = false>
+__global__ void k_kv_gather(const void* __restrict__ kc, const void* __restrict__ vc, __half* __restrict__ k16,
                             __half* __restrict__ v16, int cap, int lo, int P, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int H2 = kHD / 2;
@@ -191,8 +217,13 @@ __global__ void k_kv_gather(const __half* __restrict__ kc, const __half* __restr
     const int64_t rest = i % per;
     const int j = (int) (rest / H2), d2 = (int) (rest % H2);
     const size_t src = ((size_t) kvh * cap + (size_t) ((lo + j) % cap)) * H2 + d2;
-    reinterpret_cast<half2*>(k16)[i] = reinterpret_cast<const half2*>(kc)[src];
-    reinterpret_cast<half2*>(v16)[i] = reinterpret_cast<const half2*>(vc)[src];
+    if constexpr (KV8) {
+        reinterpret_cast<uint32_t*>(k16)[i] = e4m3x2_to_h2(reinterpret_cast<const uint16_t*>(kc)[src]);
+        reinterpret_cast<uint32_t*>(v16)[i] = e4m3x2_to_h2(reinterpret_cast<const uint16_t*>(vc)[src]);
+    } else {
+        reinterpret_cast<half2*>(k16)[i] = reinterpret_cast<const half2*>(kc)[src];
+        reinterpret_cast<half2*>(v16)[i] = reinterpret_cast<const half2*>(vc)[src];
+    }
 }
 
 /// The prompt's softmax with the sink: row (h, t) of S (ld floats, P cells from absolute cell lo) -> FP16 probabilities
@@ -827,9 +858,10 @@ __device__ __forceinline__ float4 head_norm_rope_t(float4 v, const float* __rest
 
 /// k_attn_dec with the rotary angles from a table (rope_tab: [ctx][64] (cos, sin), null on a no-rope layer), 16-byte K / V
 /// tile loads and exp2 softmax.  The same launch shape and outputs.
+template <bool KV8 = false>
 __global__ void __launch_bounds__(256) k_attn_dec2(const float* __restrict__ qs_, int ldq, const float* __restrict__ ks_, int ldk,
                                                    const float* __restrict__ vs_, int ldv, const float* __restrict__ qw,
-                                                   const float* __restrict__ kw, __half* __restrict__ kc, __half* __restrict__ vc,
+                                                   const float* __restrict__ kw, void* __restrict__ kc_, void* __restrict__ vc_,
                                                    int H, int cap, int ring, int win, const float2* __restrict__ rope_tab,
                                                    const int32_t* __restrict__ pos0, float eps, float scale, int NS,
                                                    float* __restrict__ pacc, float* __restrict__ pm, float* __restrict__ pl,
@@ -859,23 +891,34 @@ __global__ void __launch_bounds__(256) k_attn_dec2(const float* __restrict__ qs_
     }
     if (c0 <= pos && pos < c1) {
         const size_t cell = (size_t) (ring ? pos % cap : pos);
+        float4 kv4 = make_float4(0.f, 0.f, 0.f, 0.f);
+        void* base = nullptr;
         if (warp == 0) {
             const float4 v = reinterpret_cast<const float4*>(ks_ + (size_t) t * ldk + (size_t) g * kHD)[lane];
-            const float4 k = head_norm_rope_t(v, kw, lane, rope, eps);
-            half2* dst = reinterpret_cast<half2*>(kc + ((size_t) g * cap + cell) * kHD) + 2 * lane;
-            dst[0] = __floats2half2_rn(k.x, k.y);
-            dst[1] = __floats2half2_rn(k.z, k.w);
+            kv4 = head_norm_rope_t(v, kw, lane, rope, eps);
+            base = kc_;
         } else if (warp == 1) {
-            const float4 v = reinterpret_cast<const float4*>(vs_ + (size_t) t * ldv + (size_t) g * kHD)[lane];
-            half2* dst = reinterpret_cast<half2*>(vc + ((size_t) g * cap + cell) * kHD) + 2 * lane;
-            dst[0] = __floats2half2_rn(v.x, v.y);
-            dst[1] = __floats2half2_rn(v.z, v.w);
+            kv4 = reinterpret_cast<const float4*>(vs_ + (size_t) t * ldv + (size_t) g * kHD)[lane];
+            base = vc_;
+        }
+        if (warp < 2) {
+            const size_t at = ((size_t) g * cap + cell) * kHD + 4 * lane;
+            if constexpr (KV8) {
+                uint16_t* dst = reinterpret_cast<uint16_t*>((uint8_t*) base + at);
+                dst[0] = f2_to_e4m3x2(kv4.x, kv4.y);
+                dst[1] = f2_to_e4m3x2(kv4.z, kv4.w);
+            } else {
+                half2* dst = reinterpret_cast<half2*>((__half*) base + at);
+                dst[0] = __floats2half2_rn(kv4.x, kv4.y);
+                dst[1] = __floats2half2_rn(kv4.z, kv4.w);
+            }
         }
     }
     float m = -INFINITY, l = 0.f;
     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-    const __half* kb = kc + (size_t) g * cap * kHD;
-    const __half* vb = vc + (size_t) g * cap * kHD;
+    constexpr int ES = KV8 ? 1 : 2;   // bytes per cached value
+    const uint8_t* kb = (const uint8_t*) kc_ + (size_t) g * cap * kHD * ES;
+    const uint8_t* vb = (const uint8_t*) vc_ + (size_t) g * cap * kHD * ES;
     for (int b0 = c0; b0 < c1; b0 += kTile) {
         __syncthreads();
         {   // 32 rows x 16 uint4 for K and for V: 512 each, two of each per thread
@@ -887,8 +930,13 @@ __global__ void __launch_bounds__(256) k_attn_dec2(const float* __restrict__ qs_
                 uint4 k4 = make_uint4(0u, 0u, 0u, 0u), v4 = k4;
                 if (c < c1) {
                     const size_t cell = (size_t) (ring ? c % cap : c);
-                    k4 = __ldg(reinterpret_cast<const uint4*>(kb + cell * kHD) + d8);
-                    v4 = __ldg(reinterpret_cast<const uint4*>(vb + cell * kHD) + d8);
+                    if constexpr (KV8) {
+                        k4 = e4m3x8_to_h8(__ldg(reinterpret_cast<const uint2*>(kb + cell * kHD) + d8));
+                        v4 = e4m3x8_to_h8(__ldg(reinterpret_cast<const uint2*>(vb + cell * kHD) + d8));
+                    } else {
+                        k4 = __ldg(reinterpret_cast<const uint4*>(kb + cell * kHD * 2) + d8);
+                        v4 = __ldg(reinterpret_cast<const uint4*>(vb + cell * kHD * 2) + d8);
+                    }
                 }
                 reinterpret_cast<uint4*>(&ks[j][0])[d8] = k4;
                 reinterpret_cast<uint4*>(&vs[j][0])[d8] = v4;
@@ -1071,6 +1119,62 @@ __global__ void __launch_bounds__(128) k_router256(const void* __restrict__ Wv, 
         grp_start[K] = K;
         *n_groups = K;
         *ticket = 0u;
+    }
+}
+
+}  // namespace flk
+
+#include <cub/block/block_radix_sort.cuh>
+
+namespace flk {
+
+/// The sampling candidates: the 64 largest logits of a row (value, id), for the host's temperature / top-k / top-p
+/// on a list instead of the whole vocabulary.  Stage 1: block b sorts its 2048 logits (CUB's block radix sort on
+/// order-preserving keys) and writes its 64 largest; stage 2: one block sorts those candidates and writes the 64.
+constexpr int kTopC = 64;
+__device__ __forceinline__ uint32_t f2ord(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float ord2f(uint32_t k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+__global__ void __launch_bounds__(256) k_topc1(const float* __restrict__ lg, int n, uint32_t* __restrict__ ck, int32_t* __restrict__ ci) {
+    using Sort = cub::BlockRadixSort<uint32_t, 256, 8, int32_t>;
+    __shared__ typename Sort::TempStorage tmp;
+    uint32_t key[8];
+    int32_t id[8];
+    const int base = blockIdx.x * 2048;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int i = base + threadIdx.x * 8 + k;
+        key[k] = i < n ? f2ord(lg[i]) : 0u;
+        id[k] = i;
+    }
+    Sort(tmp).SortDescendingBlockedToStriped(key, id);
+    // striped: item k of thread t is rank k * 256 + t
+    if (threadIdx.x < kTopC) {
+        ck[blockIdx.x * kTopC + threadIdx.x] = key[0];
+        ci[blockIdx.x * kTopC + threadIdx.x] = id[0];
+    }
+}
+template <int ITEMS>
+__global__ void __launch_bounds__(512) k_topc2(const uint32_t* __restrict__ ck, const int32_t* __restrict__ ci, int nc,
+                                               float* __restrict__ ov, int32_t* __restrict__ oi) {
+    using Sort = cub::BlockRadixSort<uint32_t, 512, ITEMS, int32_t>;
+    __shared__ typename Sort::TempStorage tmp;
+    uint32_t key[ITEMS];
+    int32_t id[ITEMS];
+#pragma unroll
+    for (int k = 0; k < ITEMS; ++k) {
+        const int i = threadIdx.x * ITEMS + k;
+        key[k] = i < nc ? ck[i] : 0u;
+        id[k] = i < nc ? ci[i] : 0;
+    }
+    Sort(tmp).SortDescendingBlockedToStriped(key, id);
+    if (threadIdx.x < kTopC) {
+        ov[threadIdx.x] = ord2f(key[0]);
+        oi[threadIdx.x] = id[0];
     }
 }
 

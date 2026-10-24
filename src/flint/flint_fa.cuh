@@ -5,7 +5,10 @@
 // softmax denominator at the end.
 #pragma once
 
+#include "flint_kernels.cuh"
+
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -43,8 +46,10 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
 /// keys from K / V [kvh][kstride][128] FP16 whose row j is cell lo + j (the full layers: the cache itself, lo 0; the
 /// window layers: the gathered window).  Row r of KV head g's rows is query r / 8, head 8 g + r % 8.  grid
 /// (ceil(T / 8), HKV), block 128.
-__global__ void __launch_bounds__(128) k_fa_prompt(const __half* __restrict__ q16, const __half* __restrict__ K,
-                                                   const __half* __restrict__ V, int kstride, int lo, int T, int H, int p0,
+/// KV8: K / V are the cache's E4M3 bytes (--kv-fp8), widened to FP16 as the tiles are loaded.
+template <bool KV8 = false>
+__global__ void __launch_bounds__(128) k_fa_prompt(const __half* __restrict__ q16, const void* __restrict__ K,
+                                                   const void* __restrict__ V, int kstride, int lo, int T, int H, int p0,
                                                    int win, float scale, const float* __restrict__ sinks,
                                                    float* __restrict__ att) {
     __shared__ __align__(16) __half ks[kBc][kStride];
@@ -56,8 +61,9 @@ __global__ void __launch_bounds__(128) k_fa_prompt(const __half* __restrict__ q1
     const int tw = t0 + 2 * warp;
     const int qa = tw, qb = tw + 1;           // a thread's two rows: (qa, head gid) and (qb, head gid)
     const int posa = p0 + qa, posb = p0 + qb;
-    const __half* Kg = K + (size_t) g * kstride * kD;
-    const __half* Vg = V + (size_t) g * kstride * kD;
+    constexpr int ES = KV8 ? 1 : 2;
+    const uint8_t* Kg = (const uint8_t*) K + (size_t) g * kstride * kD * ES;
+    const uint8_t* Vg = (const uint8_t*) V + (size_t) g * kstride * kD * ES;
     // Q fragments (A, 16 x 128 as 8 k-steps) straight from global: rows (q, head) of this warp
     uint32_t qf[8][4];
     {
@@ -93,8 +99,13 @@ __global__ void __launch_bounds__(128) k_fa_prompt(const __half* __restrict__ q1
             const int c = c0 + j;
             uint4 k4 = make_uint4(0u, 0u, 0u, 0u), v4 = k4;
             if (c <= cend) {
-                k4 = __ldg(reinterpret_cast<const uint4*>(Kg + (size_t) (c - lo) * kD) + d8);
-                v4 = __ldg(reinterpret_cast<const uint4*>(Vg + (size_t) (c - lo) * kD) + d8);
+                if constexpr (KV8) {
+                    k4 = flk::e4m3x8_to_h8(__ldg(reinterpret_cast<const uint2*>(Kg + (size_t) (c - lo) * kD) + d8));
+                    v4 = flk::e4m3x8_to_h8(__ldg(reinterpret_cast<const uint2*>(Vg + (size_t) (c - lo) * kD) + d8));
+                } else {
+                    k4 = __ldg(reinterpret_cast<const uint4*>(Kg + (size_t) (c - lo) * kD * 2) + d8);
+                    v4 = __ldg(reinterpret_cast<const uint4*>(Vg + (size_t) (c - lo) * kD * 2) + d8);
+                }
             }
             *reinterpret_cast<uint4*>(&ks[j][d8 * 8]) = k4;
             *reinterpret_cast<uint4*>(&vs[j][d8 * 8]) = v4;
