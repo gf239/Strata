@@ -102,6 +102,9 @@ int main(int argc, char** argv) {
     cp.n_ctx = nctx;
     cp.n_batch = nctx;
     cp.n_ubatch = ub ? std::atoi(ub) : nctx;
+    // STRATA_DUMP_THREADS: CPU threads (llama.cpp's default is 4; the BF16 CPU reference wants every core)
+    const char* th = std::getenv("STRATA_DUMP_THREADS");
+    if (th) cp.n_threads = cp.n_threads_batch = std::atoi(th);
     cp.op_offload = ngl > 0;   // --ngl 0 is the CPU backend: no prompt matmuls offloaded to a GPU either
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &cap;

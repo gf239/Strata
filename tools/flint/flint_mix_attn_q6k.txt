@@ -1,0 +1,13 @@
+attn_q=q6_k
+attn_k=q6_k
+attn_v=q6_k
+attn_output=q6_k
+ffn_gate_exps=q4_k
+ffn_up_exps=q4_k
+ffn_down_exps=q4_k
+ffn_gate_shexp=q8_0
+ffn_up_shexp=q8_0
+ffn_down_shexp=q8_0
+ffn_gate=q4_k
+ffn_up=q4_k
+ffn_down=q4_k

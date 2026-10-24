@@ -990,7 +990,8 @@ class StrataEngine:
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
-        self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        mc = args[args.index("--max-context") + 1] if "--max-context" in args else "4096"
+        self.max_context = int(mc) if mc.isdigit() else 0   # "auto": the engine's READY <ctx> line sets it
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
