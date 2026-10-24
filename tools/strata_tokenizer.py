@@ -78,6 +78,20 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# The `flint` pre-tokenizer (Recursive Flint; llama.cpp LLAMA_VOCAB_PRE_TYPE_FLINT, the tokenizer.json's Sequence of
+# three Splits): digits in runs of 1..3 and CJK runs cut out first, then a cased-word / punctuation / whitespace pattern
+# (contractions spelled out as llama.cpp spells them, the same matches as tokenizer.json's `(?i:'s|'t|...)`).
+FLINT_PATTERNS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -119,8 +133,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if str(pre).startswith("deepseek"):
-            seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
+        if str(pre).startswith("deepseek") or pre == "flint":
+            seq = [regex.compile(x) for x in (FLINT_PATTERNS if pre == "flint" else DEEPSEEK3_PATTERNS)]
             self._split = lambda text: _sequence_findall(seq, text)
         else:
             self._re = regex.compile(QWEN35_PATTERN)

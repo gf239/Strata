@@ -3947,6 +3947,10 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "flint":
+            from serve import flint
+            self.stop_ids = set(flint.STOP_IDS)
+            self.parser_cls = flint.FlintOutputParser
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -8045,7 +8049,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+                      "deepseek41": "deepseek-v4.1-flash", "flint": "flint"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8060,6 +8064,9 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Recursive Flint: temperature 1.0, top_p 0.95, top_k 20 (generation_config.json; it decides itself whether to reason)
+    "flint": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+              "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
 }
 
 
@@ -8446,7 +8453,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "flint") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

@@ -794,6 +794,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # Recursive Flint (GGUF architecture flint, 40B-A2.5B): src/flint/flint_engine.cu, a library `strata` switches to for a
+  # flint model (the family switch at the top of its main) and that strata-flint wraps on its own; the same shape and
+  # the same kernels as the Qwen3.6 path, the attention (sinks, a sliding window) and the router (sigmoid) its own
+  if(NOT STRATA_HIP_GFX906)
+  add_library(strata_flint STATIC src/flint/flint_engine.cu)
+  target_include_directories(strata_flint PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_flint PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  add_executable(strata-flint src/flint/flint_main.cpp)
+  strata_utf8_manifest(strata-flint)
+  target_link_libraries(strata-flint PRIVATE strata_flint ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_flint)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_FLINT=1)
+  endif()
+
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).
   # Its own executable for now (strata-dsv41); a family switch in `strata` comes after first light.  OFF by default: it
   # changes no existing target (the vendored kernels live in strata::dsv41k, so no symbol is shared with strata_kernels).

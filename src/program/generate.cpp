@@ -101,6 +101,9 @@
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
+#if defined(STRATA_HAVE_FLINT)
+#include "strata/flint/engine.hpp"
+#endif
 #endif
 #if defined(_WIN32)
 #include <windows.h>
@@ -2404,6 +2407,20 @@ int main(int argc, char** argv) {
             // not readable here: the normal path below reports it
         }
         if (qwen35) return strata::qwen35::run(argc, argv);
+        break;
+    }
+#endif
+#if defined(STRATA_HAVE_FLINT)
+    // the same switch for a Recursive Flint file (GGUF architecture flint): its own engine path, src/flint
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
+        bool flint = false;
+        try {
+            const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
+            flint = strata::model_family(meta) == strata::ModelFamily::Flint;
+        } catch (const std::exception&) {
+        }
+        if (flint) return strata::flint::run(argc, argv);
         break;
     }
 #endif

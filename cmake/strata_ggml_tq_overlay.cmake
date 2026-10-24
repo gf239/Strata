@@ -63,7 +63,16 @@ function(strata_ggml_tq_overlay LLAMA OUT)
     get_filename_component(_n "${_f}" NAME)
     configure_file("${_f}" "${OUT}/${_n}" COPYONLY)
   endforeach()
-  configure_file("${_cu}/quantize.cu" "${OUT}/quantize.cu" COPYONLY)   # compiled from here: it includes mmq.cuh
+  # compiled from here: it includes mmq.cuh.  #606 for the prompt's MMQ activations as well: the q8_1 blocks' fp16 sums kept
+  # finite (a massive-activation block's sum past 65504 rounded to inf and every product read inf * 0 = NaN; Flint's last
+  # layers carry such blocks), clamped as strata::kernels::q8_1_finite does; a finite block is stored bit for bit as before
+  file(READ "${_cu}/quantize.cu" _qz)
+  set(_fin_sum "(fabsf(sum) > 65504.0f ? copysignf(65504.0f, sum) : sum)")
+  set(_fin_d "(fabsf(d) > 65504.0f ? copysignf(65504.0f, d) : d)")
+  string(REPLACE "y[ib].ds4[iqs/32] = make_half2(d, sum);" "y[ib].ds4[iqs/32] = make_half2(${_fin_d}, ${_fin_sum});" _qz "${_qz}")
+  string(REPLACE "y[ib].d2s6[2 + iqs/16] = sum;" "y[ib].d2s6[2 + iqs/16] = ${_fin_sum};" _qz "${_qz}")
+  string(REPLACE "y[ib].ds = make_half2(d, sum);" "y[ib].ds = make_half2(${_fin_d}, ${_fin_sum});" _qz "${_qz}")
+  file(WRITE "${OUT}/quantize.cu" "${_qz}")
   if(IS_DIRECTORY "${_cu}/vendors")
     file(COPY "${_cu}/vendors" DESTINATION "${OUT}")
   endif()
